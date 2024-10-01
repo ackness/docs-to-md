@@ -12,7 +12,11 @@ logger = logging.getLogger("D2M")
 @click.command()
 @click.option("--url", "-u", type=str, help="Root url of the readthedocs project")
 @click.option(
-    "--project-name", "-p", default="default", type=str, help="Name of the project",
+    "--project-name",
+    "-p",
+    default="default",
+    type=str,
+    help="Name of the project",
 )
 @click.option(
     "--target-path",
@@ -25,7 +29,7 @@ logger = logging.getLogger("D2M")
     "--no_jina",
     "-nj",
     is_flag=True,
-    help="Use ollama to parse html to markdown, if true, --token is required, and will ignore --api and --model",
+    help="Use open-based api (default: ollama reader-lm) to parse html to markdown, if true, --token is required, and will ignore --api and --model",
 )
 @click.option(
     "--api",
