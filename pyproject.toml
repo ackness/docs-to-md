@@ -1,6 +1,6 @@
 [project]
 name = "docs-to-md"
-version = "0.1.1"
+version = "0.1.2"
 description = "Convert readthedocs to markdown"
 authors = [{ name = "ackness", email = "ackness8@gmail.com" }]
 dependencies = [
