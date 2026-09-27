@@ -1,3 +1,4 @@
+import httpx
 import respx
 from typer.testing import CliRunner
 
@@ -45,3 +46,27 @@ def test_cli_readthedocs_failure_exit_code(tmp_path):
         )
     assert result.exit_code == 1
     assert "1/3 pages" in result.output
+
+
+def test_cli_unreachable_index_is_clean_error(tmp_path):
+    """A dead index URL must print a clean error, not a traceback."""
+    with respx.mock:
+        respx.get(INDEX_URL).respond(404)
+        result = runner.invoke(
+            app,
+            ["readthedocs", INDEX_URL, "-o", str(tmp_path), "--retries", "0"],
+        )
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "error:" in result.output
+
+
+def test_cli_unreachable_index_verbose_raises(tmp_path):
+    with respx.mock:
+        respx.get(INDEX_URL).respond(404)
+        result = runner.invoke(
+            app,
+            ["readthedocs", INDEX_URL, "-o", str(tmp_path), "--retries", "0", "-v"],
+        )
+    assert result.exit_code == 1
+    assert isinstance(result.exception, httpx.HTTPStatusError)

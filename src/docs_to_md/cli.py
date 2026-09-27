@@ -117,19 +117,25 @@ def readthedocs(
         progress.update(task_id, total=total, completed=done)
 
     with progress:
-        result = asyncio.run(
-            convert_readthedocs(
-                url,
-                converter=converter,
-                output_dir=output_dir,
-                project_name=name,
-                concurrency=concurrency,
-                request_timeout=request_timeout,
-                retries=retries,
-                save_html=save_html,
-                on_progress=on_progress,
+        try:
+            result = asyncio.run(
+                convert_readthedocs(
+                    url,
+                    converter=converter,
+                    output_dir=output_dir,
+                    project_name=name,
+                    concurrency=concurrency,
+                    request_timeout=request_timeout,
+                    retries=retries,
+                    save_html=save_html,
+                    on_progress=on_progress,
+                )
             )
-        )
+        except Exception as exc:
+            if verbose:
+                raise
+            typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
 
     for page in result.failed:
         typer.secho(f"  failed: {page.url} ({page.error})", fg=typer.colors.RED, err=True)
