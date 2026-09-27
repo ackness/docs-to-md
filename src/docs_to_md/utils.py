@@ -1,168 +1,172 @@
+from __future__ import annotations
+
+import asyncio
 import logging
-import os
 import re
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import httpx
-import openai
-import requests
-from lxml import html
+from lxml import html as lxml_html
 
-logger = logging.getLogger("D2M")
+logger = logging.getLogger(__name__)
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
 
-async def fetch(url: str, **kwargs) -> str:
-    """
-    Fetch the html content from the url.
-    Args:
-        url: url to fetch
-        kwargs: httpx.AsyncClient kwargs
-    Returns:
-        html content
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    }
-    async with httpx.AsyncClient(**kwargs) as client:
-        try:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            return response.text
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Failed to fetch {url}: {e}")
-            return ""
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+RETRYABLE_ERRORS = (httpx.TimeoutException, httpx.TransportError)
 
 
-async def openai_chat(content: str, base_url: str, api_key: str, model: str) -> str:
-    """
-    Chat with openai-based model.
-    Args:
-        content: html content
-        base_url: base url of the openai api
-        api_key: api key of the openai api
-        model: which model to use
-    Returns:
-        the chat response
-    """
-    client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key)
-
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            stream=False,
-            messages=[
-                {
-                    "role": "user",
-                    "content": content,
-                },
-            ],
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logger.error(
-            f"Failed to fetch result from openai chat ({base_url}) model: {model} error: {e}",
-        )
-        return ""
-
-
-async def parse_html_to_markdown_openai(
-    html: str,
+async def request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
     *,
-    openai_api: str = "http://localhost:11434/v1",
-    openai_token: str = "ollama",
-    openai_model: str = "reader-lm",
-) -> str:
+    retries: int = 3,
+    base_delay: float = 1.0,
+    **kwargs,
+) -> httpx.Response:
+    """Send a request, retrying on 429/5xx and transient network errors.
+
+    Honors the ``Retry-After`` response header when present, otherwise uses
+    exponential backoff. Raises the last ``httpx`` error on exhaustion.
     """
-    Parse the html content to markdown content using openai chat.
-    Args:
-        html: html content
-        openai_api: base url of the openai api, default is `http://localhost:11434/v1`
-        openai_token: api key of the openai api, default is `ollama`
-        openai_model: which model to use, default is `reader-lm`
-    Returns:
-        markdown content
+    delay = base_delay
+    for attempt in range(retries + 1):
+        try:
+            response = await client.request(method, url, **kwargs)
+        except RETRYABLE_ERRORS:
+            if attempt >= retries:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
+            continue
+
+        if response.status_code in RETRYABLE_STATUS and attempt < retries:
+            retry_after = response.headers.get("retry-after")
+            wait = float(retry_after) if retry_after else delay
+            logger.warning(
+                "%s %s -> %s, retrying in %.1fs (%d/%d)",
+                method,
+                url,
+                response.status_code,
+                wait,
+                attempt + 1,
+                retries,
+            )
+            await asyncio.sleep(wait)
+            delay *= 2
+            continue
+
+        response.raise_for_status()
+        return response
+
+    raise RuntimeError("unreachable")
+
+
+async def fetch_text(client: httpx.AsyncClient, url: str, *, retries: int = 3) -> str:
+    """Fetch a URL and return its body text, with retries."""
+    response = await request_with_retry(client, "GET", url, retries=retries)
+    return response.text
+
+
+def normalize_index_url(url: str) -> str:
+    """Strip a trailing ``*.html`` filename so the URL is the docs root."""
+    url = url.split("#", 1)[0].split("?", 1)[0]
+    url = re.sub(r"/[^/]+\.html$", "", url)
+    return url if url.endswith("/") else url + "/"
+
+
+def extract_project_name_from_url(url: str) -> str:
+    """Derive a filesystem-friendly project name from a docs URL."""
+    parsed = urlparse(url)
+    host = parsed.hostname or "docs"
+    if host.endswith("readthedocs.io") or "readthedocs" in host:
+        return host.split(".")[0]
+    # Custom domain: prefer the first path segment (e.g. docs.python.org/3/ -> "3"),
+    # otherwise fall back to the second-level domain label.
+    segment = next((s for s in parsed.path.split("/") if s), None)
+    if segment:
+        return segment
+    parts = host.split(".")
+    return parts[-2] if len(parts) >= 2 else parts[0]
+
+
+def _page_name(index_url: str, url: str) -> str:
+    relative = url.removeprefix(index_url).strip("/")
+    relative = re.sub(r"\.html$", "", relative)
+    name = re.sub(r"[^0-9A-Za-z._-]+", "_", relative).strip("_")
+    return name or "index"
+
+
+def discover_sub_urls(index_url: str, index_html: str) -> dict[str, str]:
+    """Extract the table-of-contents links of a Sphinx/ReadTheDocs index page.
+
+    Returns a mapping of ``{page_name: absolute_url}``; the index page itself
+    is included under the name ``"index"``.
     """
-    content = await openai_chat(html, openai_api, openai_token, openai_model)
-    return content
+    tree = lxml_html.fromstring(index_html)
+    hrefs = tree.xpath('//a[contains(@class, "reference internal")]/@href')
+    base = urlparse(index_url)
+    pages: dict[str, str] = {}
+    for href in hrefs:
+        url = urljoin(index_url, href).split("#", 1)[0]
+        parsed = urlparse(url)
+        if parsed.netloc != base.netloc or not url.endswith(".html"):
+            continue
+        pages.setdefault(_page_name(index_url, url), url)
+    pages.setdefault("index", index_url)
+    return pages
 
 
-def remove_end_html(url: str) -> str:
+def preprocess_html(content: str) -> str:
+    """Reduce a documentation page to its article body, minus noise.
+
+    Removes scripts, styles, images, navigation and presentational
+    attributes so downstream converters see only the content.
     """
-    Remove the end html from the url.
-    Args:
-        url: url to remove the end html
-    Returns:
-        url without end html
-    """
-    return re.sub(r"/[^/]+\.html$", "", url)
+    tree = lxml_html.fromstring(content)
 
-
-def get_readthedocs_sub_urls(index_url: str, index_response: str) -> dict[str, str]:
-    """
-    Parse the readthedocs project and return the sub urls.
-    Args:
-        index_url: root url of the readthedocs project
-
-    Returns:
-        sub urls: a dict of sub urls, {name: url}
-    """
-    # index may contain *.html, remove it
-    if index_url.endswith(".html"):
-        index_url = remove_end_html(index_url)
-
-    tree = html.fromstring(index_response)
-    sub_urls = tree.xpath('//a[contains(@class, "reference internal")]/@href')
-    sub_urls = [requests.compat.urljoin(index_url, url) for url in sub_urls]
-    # remove duplicate urls
-    sub_urls = list(set(sub_urls))
-    # remove urls that are not html
-    sub_urls = [url for url in sub_urls if url.endswith(".html")]
-    return {
-        url.replace(index_url, "").replace(".html", "").replace("/", "_"): url
-        for url in sub_urls
-    }
-
-
-def preprocess_readthedocs_html(html_content):
-    # parse html
-    tree = html.fromstring(html_content)
-
-    # remove script, style and img elements
-    for element in tree.xpath("//script | //style | //img"):
+    for element in tree.xpath("//script | //style | //noscript | //img"):
         element.getparent().remove(element)
-
-    # remove all class and id attributes
+    # Sphinx "permalink to this heading" anchors render as noise in Markdown
+    for element in tree.xpath('//a[contains(@class, "headerlink")]'):
+        element.getparent().remove(element)
+    for element in tree.xpath("//*[@role='navigation' or @role='banner' or @role='contentinfo']"):
+        element.getparent().remove(element)
     for element in tree.xpath("//*[@class or @id]"):
         element.attrib.pop("class", None)
         element.attrib.pop("id", None)
 
-    # remove role="navigation" elements
-    for element in tree.xpath("//*[@role='navigation']"):
-        element.getparent().remove(element)
+    for query in (
+        "//*[@itemprop='articleBody']",
+        "//*[@role='main']",
+        "//main",
+        "//article",
+        "//body",
+    ):
+        matches = tree.xpath(query)
+        if matches:
+            body = matches[0]
+            break
+    else:
+        body = tree
 
-    # only save articleBody part
-    body = tree.xpath("//*[@itemprop='articleBody']")[0]
-
-    # convert processed html to string
-    processed_html = html.tostring(body, encoding="unicode", pretty_print=True)
-
-    # simple text cleaning
-    processed_html = re.sub(r"\s+", " ", processed_html)
-    processed_html = re.sub(r"\n+", "\n", processed_html)
-
-    return processed_html
-
-
-def save_file(fp: str, s: str):
-    make_dirs(os.path.dirname(fp))
-
-    with open(fp, "w", encoding="utf-8") as f:
-        f.write(s)
+    cleaned = lxml_html.tostring(body, encoding="unicode")
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n\s*\n+", "\n\n", cleaned)
+    return cleaned.strip()
 
 
-def make_dirs(fp: str):
-    if not os.path.exists(fp):
-        os.makedirs(fp, exist_ok=True)
+def save_text(path: Path, content: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
 
 
-def extract_project_name_from_url(url: str) -> str:
-    return url.split("/")[2].split(".")[0]
+def page_file_stem(name: str) -> str:
+    return re.sub(r"[^0-9A-Za-z._-]+", "_", name) or "index"
